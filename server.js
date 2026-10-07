@@ -6,38 +6,36 @@ const app = express();
 const server = createServer(app);
 
 const PORT = Number(process.env.PORT || 10000);
+
+// =====================================================
+// НАСТРОЙКИ — API-КЛЮЧ ЗДЕСЬ НЕ ПРОПИСЫВАТЬ!
+// Ключ берётся из Render → Environment Variables
+// =====================================================
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-live";
-const ALLOWED_ORIGINS_RAW = process.env.ALLOWED_ORIGINS || "*";
+
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || "gemini-3.8-live";
+
+const GEMINI_VOICE =
+  process.env.GEMINI_VOICE || "Puck";
+
+// =====================================================
+// ПРОВЕРКА
+// =====================================================
 
 if (!GEMINI_API_KEY) {
-  console.warn("[GENESIS] GEMINI_API_KEY is not set. The service will start, but Gemini sessions will fail.");
-}
-
-const ALLOWED_ORIGINS = ALLOWED_ORIGINS_RAW
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-function isOriginAllowed(origin) {
-  if (!origin) return true;
-  if (ALLOWED_ORIGINS.includes("*")) return true;
-  return ALLOWED_ORIGINS.includes(origin);
-}
-
-function rejectUpgrade(socket, statusCode, statusText) {
-  socket.write(
-    `HTTP/1.1 ${statusCode} ${statusText}\r\n` +
-    "Connection: close\r\n" +
-    "Content-Length: 0\r\n\r\n"
+  console.error(
+    "[GENESIS] ERROR: GEMINI_API_KEY is not configured"
   );
-  socket.destroy();
 }
 
-app.disable("x-powered-by");
+// =====================================================
+// HTTP
+// =====================================================
 
-app.get("/", (_req, res) => {
-  res.status(200).json({
+app.get("/", (req, res) => {
+  res.json({
     service: "Genesis Extra — Gemini Live Proxy",
     ok: true,
     websocket: "/gemini",
@@ -45,280 +43,422 @@ app.get("/", (_req, res) => {
   });
 });
 
-app.get("/health", (_req, res) => {
-  res.status(200).json({
+app.get("/health", (req, res) => {
+  res.json({
     ok: true,
+    service: "Genesis Extra",
     geminiKeyConfigured: Boolean(GEMINI_API_KEY),
     model: GEMINI_MODEL
   });
 });
 
+// =====================================================
+// WEBSOCKET SERVER
+// =====================================================
+
 const wss = new WebSocketServer({
   noServer: true,
-  maxPayload: 4 * 1024 * 1024,
-  clientTracking: true
+  maxPayload: 4 * 1024 * 1024
 });
+
+// =====================================================
+// UPGRADE
+// =====================================================
 
 server.on("upgrade", (request, socket, head) => {
-  try {
-    const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+  const url = new URL(
+    request.url,
+    `http://${request.headers.host}`
+  );
 
-    if (url.pathname !== "/gemini") {
-      rejectUpgrade(socket, 404, "Not Found");
-      return;
-    }
-
-    const origin = request.headers.origin || "";
-    if (!isOriginAllowed(origin)) {
-      rejectUpgrade(socket, 403, "Forbidden");
-      return;
-    }
-
-    if (!GEMINI_API_KEY) {
-      rejectUpgrade(socket, 503, "Service Unavailable");
-      return;
-    }
-
-    wss.handleUpgrade(request, socket, head, (clientSocket) => {
-      wss.emit("connection", clientSocket, request);
-    });
-  } catch (error) {
-    console.error("[GENESIS] Upgrade error:", error);
-    rejectUpgrade(socket, 400, "Bad Request");
+  if (url.pathname !== "/gemini") {
+    socket.destroy();
+    return;
   }
+
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit("connection", ws, request);
+  });
 });
 
-wss.on("connection", (client, request) => {
-  const origin = request.headers.origin || "unknown";
-  const clientIp =
-    request.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
-    request.socket.remoteAddress ||
-    "unknown";
+// =====================================================
+// CLIENT → GEMINI
+// =====================================================
 
-  console.log(`[GENESIS] Client connected from ${clientIp}; origin=${origin}`);
+wss.on("connection", (client) => {
+  console.log("[GENESIS] Tilda client connected");
+
+  if (!GEMINI_API_KEY) {
+    client.send(
+      JSON.stringify({
+        genesisProxyError: true,
+        message:
+          "На Render не задан GEMINI_API_KEY"
+      })
+    );
+
+    client.close();
+    return;
+  }
 
   let upstream = null;
-  let upstreamOpen = false;
-  let closed = false;
-  const pending = [];
+  let setupComplete = false;
+  let setupTimer = null;
+
+  // ---------------------------------------------------
+  // Безопасная отправка клиенту
+  // ---------------------------------------------------
+
+  function sendClient(data) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(data);
+    }
+  }
+
+  // ---------------------------------------------------
+  // Подключение к Gemini Live
+  // ---------------------------------------------------
 
   const geminiUrl =
     "wss://generativelanguage.googleapis.com/ws/" +
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
     `?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
-  function safeSendClient(payload) {
-    if (closed) return;
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
-    }
-  }
-
-  function closeBoth(code = 1000, reason = "closed") {
-    if (closed) return;
-    closed = true;
-
-    if (upstream && upstream.readyState === WebSocket.OPEN) {
-      try { upstream.close(code, reason); } catch {}
-    } else if (upstream && upstream.readyState === WebSocket.CONNECTING) {
-      try { upstream.terminate(); } catch {}
-    }
-
-    if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
-      try { client.close(code, reason); } catch {}
-    }
-  }
+  console.log("[GENESIS] Connecting to Gemini Live...");
+  console.log("[GENESIS] Model:", GEMINI_MODEL);
 
   upstream = new WebSocket(geminiUrl, {
     handshakeTimeout: 15000,
     perMessageDeflate: false
   });
 
-  upstream.on("open", () => {
-    upstreamOpen = true;
-    console.log("[GENESIS] Connected to Gemini Live.");
+  // ---------------------------------------------------
+  // GEMINI CONNECTED
+  // ---------------------------------------------------
 
-    const setup = {
+  upstream.on("open", () => {
+    console.log(
+      "[GENESIS] Connected to Gemini Live"
+    );
+
+    // =================================================
+    // ВАЖНО:
+    // Здесь специально оставлена МИНИМАЛЬНАЯ setup-конфигурация.
+    // Не добавляем languageCodes / mode / languageCode /
+    // realtimeInputConfig — они раньше могли ломать setup.
+    // =================================================
+
+    const setupMessage = {
       setup: {
         model: `models/${GEMINI_MODEL}`,
+
         generationConfig: {
           responseModalities: ["AUDIO"],
+
           speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: {
-                voiceName: process.env.GEMINI_VOICE || "Puck"
+                voiceName: GEMINI_VOICE
               }
-            },
-            languageCode: process.env.GEMINI_LANGUAGE || "ru-RU"
+            }
           }
         },
-        inputAudioTranscription: {
-          languageCodes: ["ru-RU"],
-          mode: "SMART"
-        },
+
+        inputAudioTranscription: {},
+
         outputAudioTranscription: {},
-        realtimeInputConfig: {
-          automaticActivityDetection: {
-            disabled: false
-          }
-        },
+
         systemInstruction: {
-          parts: [{
-            text:
-              "Ты Genesis Extra — живой, дружелюбный и очень естественный голосовой AI-помощник. " +
-              "Отвечай на русском языке, если пользователь не просит другой язык. " +
-              "Говори коротко, естественно и по делу, без длинных формальных монологов. " +
-              "Учитывай контекст всего текущего диалога. " +
-              "Ты можешь помогать с электроникой, товарами, продажами, закупками, технологиями, " +
-              "программированием, бизнесом, бытовыми и общими вопросами. " +
-              "Не утверждай, что у тебя есть доступ к веб-поиску, генерации изображений, видео или внешним системам, " +
-              "если конкретный инструмент не был реально подключён к этой сессии. " +
-              "Если информации недостаточно, честно скажи об этом и предложи следующий шаг. " +
-              "Главная задача — живой полезный разговор с человеком."
-          }]
+          parts: [
+            {
+              text:
+                "Ты Genesis Extra — живой голосовой AI-ассистент. " +
+                "Общайся естественно, спокойно и доброжелательно. " +
+                "Основной язык общения — русский. " +
+                "Понимай речь пользователя и отвечай как живой человек. " +
+                "Не повторяй без необходимости слова пользователя. " +
+                "Отвечай кратко и по существу, когда вопрос простой."
+            }
+          ]
         }
       }
     };
 
-    upstream.send(JSON.stringify(setup));
+    console.log(
+      "[GENESIS] Sending Gemini setup..."
+    );
 
-    while (pending.length && upstream.readyState === WebSocket.OPEN) {
-      const msg = pending.shift();
-      upstream.send(msg, { binary: false });
-    }
+    upstream.send(
+      JSON.stringify(setupMessage)
+    );
+
+    // Если Gemini не ответил setupComplete
+    // в течение 15 секунд — показываем ошибку.
+
+    setupTimer = setTimeout(() => {
+      if (!setupComplete) {
+        console.error(
+          "[GENESIS] ERROR: Gemini setup timeout"
+        );
+
+        sendClient(
+          JSON.stringify({
+            genesisProxyError: true,
+            message:
+              "Gemini Live не подтвердил setup за 15 секунд."
+          })
+        );
+      }
+    }, 15000);
   });
 
-  upstream.on("message", (data, isBinary) => {
-    if (closed) return;
+  // ---------------------------------------------------
+  // GEMINI MESSAGE
+  // ---------------------------------------------------
+
+  upstream.on("message", (raw) => {
+    const text = raw.toString();
+
+    let message = null;
 
     try {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(data, { binary: isBinary });
-      }
+      message = JSON.parse(text);
     } catch (error) {
-      console.error("[GENESIS] Failed to forward Gemini -> client:", error);
-      closeBoth(1011, "proxy-forward-error");
+      console.error(
+        "[GENESIS] Gemini sent invalid JSON"
+      );
+
+      return;
     }
+
+    // =================================================
+    // ОШИБКА GEMINI
+    // =================================================
+
+    if (message.error) {
+      console.error(
+        "[GENESIS] GEMINI ERROR:",
+        JSON.stringify(message.error, null, 2)
+      );
+
+      sendClient(
+        JSON.stringify({
+          genesisProxyError: true,
+          message:
+            message.error.message ||
+            "Gemini Live вернул ошибку",
+          error: message.error
+        })
+      );
+
+      return;
+    }
+
+    // =================================================
+    // SETUP COMPLETE
+    // =================================================
+
+    if (message.setupComplete !== undefined) {
+      setupComplete = true;
+
+      if (setupTimer) {
+        clearTimeout(setupTimer);
+        setupTimer = null;
+      }
+
+      console.log(
+        "[GENESIS] Gemini setup complete"
+      );
+    }
+
+    // =================================================
+    // ПЕРЕДАЁМ ВСЁ В TILDA
+    // =================================================
+
+    sendClient(text);
   });
+
+  // ---------------------------------------------------
+  // GEMINI ERROR
+  // ---------------------------------------------------
 
   upstream.on("error", (error) => {
-    console.error("[GENESIS] Gemini WebSocket error:", error.message);
-    safeSendClient(JSON.stringify({
-      genesisProxyError: true,
-      message: "Ошибка подключения к Gemini Live."
-    }));
-  });
+    console.error(
+      "[GENESIS] Gemini WebSocket error:",
+      error.message
+    );
 
-  upstream.on("close", (code, reasonBuffer) => {
-    const reason = reasonBuffer?.toString?.() || "";
-    console.log(`[GENESIS] Gemini closed: ${code} ${reason}`);
-
-    if (!closed && client.readyState === WebSocket.OPEN) {
-      safeSendClient(JSON.stringify({
-        genesisProxyClosed: true,
-        code,
-        reason
-      }));
-
-      try {
-        client.close(1011, "gemini-closed");
-      } catch {}
-    }
-  });
-
-  client.on("message", (data, isBinary) => {
-    if (closed) return;
-
-    if (isBinary) {
-      // We use JSON text frames from the Tilda client.
-      safeSendClient(JSON.stringify({
+    sendClient(
+      JSON.stringify({
         genesisProxyError: true,
-        message: "Binary client frames are not supported by this proxy."
-      }));
-      return;
+        message:
+          "Ошибка WebSocket Gemini: " +
+          error.message
+      })
+    );
+  });
+
+  // ---------------------------------------------------
+  // GEMINI CLOSE
+  // ---------------------------------------------------
+
+  upstream.on("close", (code, reason) => {
+    const reasonText =
+      reason?.toString() || "";
+
+    console.log(
+      "[GENESIS] Gemini connection closed:",
+      code,
+      reasonText
+    );
+
+    if (setupTimer) {
+      clearTimeout(setupTimer);
+      setupTimer = null;
     }
 
-    const message = data.toString();
-
-    // The client must never send a "setup" message.
-    // The proxy owns the setup so the API key and model configuration stay server-side.
-    try {
-      const parsed = JSON.parse(message);
-      if (parsed?.setup) {
-        safeSendClient(JSON.stringify({
+    if (
+      client.readyState === WebSocket.OPEN
+    ) {
+      client.send(
+        JSON.stringify({
           genesisProxyError: true,
-          message: "Setup is managed by the Genesis proxy."
-        }));
-        return;
-      }
-    } catch {
-      safeSendClient(JSON.stringify({
-        genesisProxyError: true,
-        message: "Некорректный JSON от клиента."
-      }));
+          message:
+            `Gemini connection closed: ${code}` +
+            (reasonText
+              ? ` — ${reasonText}`
+              : "")
+        })
+      );
+
+      client.close();
+    }
+  });
+
+  // ===================================================
+  // TILDA → GEMINI
+  // ===================================================
+
+  client.on("message", (raw) => {
+    if (!upstream) {
       return;
     }
 
-    if (!upstreamOpen || !upstream || upstream.readyState !== WebSocket.OPEN) {
-      if (pending.length < 100) {
-        pending.push(message);
-      }
+    if (
+      upstream.readyState !== WebSocket.OPEN
+    ) {
+      console.log(
+        "[GENESIS] Gemini is not ready yet"
+      );
+
       return;
     }
+
+    const text = raw.toString();
 
     try {
-      upstream.send(message);
+      JSON.parse(text);
     } catch (error) {
-      console.error("[GENESIS] Failed to forward client -> Gemini:", error);
-      closeBoth(1011, "proxy-forward-error");
+      console.error(
+        "[GENESIS] Client sent invalid JSON"
+      );
+
+      return;
+    }
+
+    // Передаём аудио / текст / realtimeInput
+    // напрямую в Gemini.
+
+    upstream.send(text);
+  });
+
+  // ---------------------------------------------------
+  // CLIENT CLOSE
+  // ---------------------------------------------------
+
+  client.on("close", () => {
+    console.log(
+      "[GENESIS] Tilda client disconnected"
+    );
+
+    if (setupTimer) {
+      clearTimeout(setupTimer);
+      setupTimer = null;
+    }
+
+    if (
+      upstream &&
+      upstream.readyState === WebSocket.OPEN
+    ) {
+      upstream.close();
     }
   });
 
-  client.on("close", (code, reasonBuffer) => {
-    const reason = reasonBuffer?.toString?.() || "";
-    console.log(`[GENESIS] Client closed: ${code} ${reason}`);
-    closeBoth(code || 1000, reason || "client-closed");
-  });
+  // ---------------------------------------------------
+  // CLIENT ERROR
+  // ---------------------------------------------------
 
   client.on("error", (error) => {
-    console.error("[GENESIS] Client WebSocket error:", error.message);
-    closeBoth(1011, "client-error");
-  });
-
-  // Render recommends ping/pong heartbeats for long-lived WebSocket connections.
-  client.isAlive = true;
-  client.on("pong", () => {
-    client.isAlive = true;
+    console.error(
+      "[GENESIS] Client WebSocket error:",
+      error.message
+    );
   });
 });
 
-const heartbeat = setInterval(() => {
-  wss.clients.forEach((client) => {
-    if (client.isAlive === false) {
-      try { client.terminate(); } catch {}
-      return;
-    }
+// =====================================================
+// HEARTBEAT
+// =====================================================
 
-    client.isAlive = false;
-    try { client.ping(); } catch {}
+setInterval(() => {
+  wss.clients.forEach((client) => {
+    if (
+      client.readyState === WebSocket.OPEN
+    ) {
+      client.ping();
+    }
   });
 }, 30000);
 
-function shutdown(signal) {
-  console.log(`[GENESIS] ${signal}: shutting down...`);
-  clearInterval(heartbeat);
+// =====================================================
+// START
+// =====================================================
 
-  try { wss.close(); } catch {}
-  try { server.close(); } catch {}
+server.listen(PORT, () => {
+  console.log(
+    `[GENESIS] Server started on port ${PORT}`
+  );
 
-  setTimeout(() => process.exit(0), 1000).unref();
+  console.log(
+    `[GENESIS] Model: ${GEMINI_MODEL}`
+  );
+
+  console.log(
+    `[GENESIS] API key configured: ${Boolean(
+      GEMINI_API_KEY
+    )}`
+  );
+});
+
+// =====================================================
+// SHUTDOWN
+// =====================================================
+
+function shutdown() {
+  console.log(
+    "[GENESIS] Shutting down..."
+  );
+
+  wss.clients.forEach((client) => {
+    try {
+      client.close();
+    } catch {}
+  });
+
+  server.close(() => {
+    process.exit(0);
+  });
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[GENESIS] Server listening on port ${PORT}`);
-  console.log(`[GENESIS] Model: ${GEMINI_MODEL}`);
-  console.log(`[GENESIS] Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
-});
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
