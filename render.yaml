@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: genesis-gemini-proxy
+    runtime: node
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.8-live
+      - key: GEMINI_VOICE
+        value: Puck
+      - key: GEMINI_LANGUAGE
+        value: ru-RU
+      - key: ALLOWED_ORIGINS
+        sync: false
